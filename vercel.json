@@ -2,12 +2,8 @@
     "version": 2,
     "routes": [
       {
-        "src": "/sse",
-        "dest": "build/index.js"
-      },
-      {
-        "src": "/messages",
-        "dest": "build/index.js"
+        "src": "/(.*)",
+        "dest": "/index.js"
       }
     ]
   }
