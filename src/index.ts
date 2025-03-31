@@ -165,5 +165,13 @@ server.resource("sample-text", "sample://text", async (uri) => {
   }
 });
 
+// For local development - this won't affect Vercel deployment
+if (process.env.NODE_ENV !== "production") {
+  const PORT = process.env.PORT || 8000;
+  app.listen(PORT, () => {
+    console.error(`[Server] Listening on port ${PORT}`);
+  });
+}
+
 // Export the Express app for Vercel serverless deployment
 export default app;
