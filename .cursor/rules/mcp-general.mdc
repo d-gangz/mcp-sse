@@ -1,0 +1,488 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# MCP Plugin Development Protocol
+
+## Project instructions and guidelines
+- Use TypeScript for MCP server development
+- Refer to @mcp-alldocs.md and [mcp-typescript.md](mdc:mcp-docs/mcp-for to create the required MCP servers
+- Provide detailed comments for all code. For each function, server prompt, server tool or server resource, share what it does, the input parameters and the output returns.
+- Use `type` instead of `interface` for type definitions
+- Implement comprehensive logging using `console.error()` for all operations
+- Use proper error handling with try/catch blocks
+- Implement rate limiting where appropriate for external API calls
+- Follow the examples below for implementing prompts, tools, and resources
+
+## Step 1: Planning (PLAN MODE)
+- What problem does this tool solve?
+- What API/service will it use?
+- What are the authentication requirements?
+  □ Standard API key
+  □ OAuth (requires separate setup script)
+  □ Other credentials
+
+## Step 2: Implementation (ACT MODE)
+
+### Core Implementation
+
+#### MCP Server Setup
+```typescript
+/**
+ * MCP-SSE Server Implementation
+ * This file implements a Model Context Protocol server using Server-Sent Events
+ * for bi-directional communication between the MCP server and clients.
+ */
+
+import express, { Request, Response } from "express";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { z } from "zod";
+
+// Create a new MCP server instance with name and version
+const server = new McpServer({
+  name: "mcp-sse", // Name of the MCP server
+  version: "1.0.0", // Version of the MCP server
+  capabilities: {
+    resources: {}, // Define resources capabilities (none defined yet)
+    tools: {}, // Define tools capabilities (none defined yet)
+  },
+});
+
+// Store SSE transports for multiple client connections
+// This allows the server to maintain multiple concurrent connections
+const transports: { [sessionId: string]: SSEServerTransport } = {};
+
+// Initialize Express application
+const app = express();
+app.use(express.json()); // Enable JSON body parsing for POST requests
+
+/**
+ * SSE Endpoint (/sse)
+ * Establishes a Server-Sent Events connection with the client.
+ * Each client gets a unique transport with a sessionId.
+ */
+app.get("/sse", async (_: Request, res: Response) => {
+  // Create a new SSE transport for this connection
+  const transport = new SSEServerTransport("/messages", res);
+  // Store the transport by its session ID for later access
+  transports[transport.sessionId] = transport;
+
+  // Clean up the transport when the connection closes
+  res.on("close", () => {
+    delete transports[transport.sessionId];
+  });
+
+  // Connect the transport to the MCP server
+  await server.connect(transport);
+});
+
+/**
+ * Messages Endpoint (/messages)
+ * Handles incoming messages from clients via POST requests.
+ * Messages are associated with a specific session using the sessionId query parameter.
+ */
+app.post("/messages", async (req: Request, res: Response) => {
+  // Extract the session ID from the query parameters
+  const sessionId = req.query.sessionId as string;
+  // Look up the corresponding transport
+  const transport = transports[sessionId];
+
+  if (transport) {
+    // If transport exists, forward the message to it
+    await transport.handlePostMessage(req, res);
+  } else {
+    // If no transport exists for this session ID, return an error
+    res.status(400).send("No transport found for sessionId");
+  }
+});
+
+// add your tools here
+
+// Export the Express app for Vercel serverless deployment
+export default app;
+```
+
+#### Comprehensive Logging
+Always use `console.error()` for logging in MCP servers:
+
+```typescript
+console.error('[Setup] Initializing server...');
+console.error('[API] Request to endpoint:', endpoint);
+console.error('[Error] Failed with:', error);
+```
+
+#### Error Handling
+Always use try/catch blocks for error handling:
+
+```typescript
+try {
+  // API call or operation that might fail
+  const result = await apiClient.performAction();
+  return { content: [{ type: "text", text: JSON.stringify(result) }] };
+} catch (error) {
+  console.error("[Error] Operation failed:", error);
+  return {
+    isError: true,
+    content: [{ 
+      type: "text", 
+      text: `Error: ${error instanceof Error ? error.message : String(error)}` 
+    }]
+  };
+}
+```
+
+### Example Implementations
+
+#### 1. Prompt Implementation Example
+
+```typescript
+/**
+ * Prompt: create-task-template
+ * Purpose: Provides a template for creating a new task with proper formatting
+ * Parameters:
+ *   - teamName: Name of the team the task is for (helps with context)
+ *   - title: Concise, specific task title
+ *   - description: Detailed description of the task
+ *   - priority: Priority level (0-4)
+ * Returns: A structured message template for creating a new task
+ */
+server.prompt(
+  "create-task-template",
+  "Template for creating a new Linear task with proper formatting",
+  {
+    teamName: z.string().describe("Name of the team this task is for"),
+    title: z.string().describe("Concise, specific task title"),
+    description: z.string().describe("Detailed description of the task"),
+    priority: z.string().describe("Priority level (0-4)")
+  },
+  async ({ teamName, title, description, priority }) => {
+    console.error(`[Prompt] Generating task template for team: ${teamName}`);
+    
+    // Return a prompt template with messages
+    return {
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text: `I need to create a new task for the ${teamName} team in Linear. 
+
+Please format it using the following structure:
+
+Title: ${title}
+
+Description:
+${description}
+
+Priority: ${priority} ${getPriorityLabel(Number(priority))}
+
+Let me know if you need any other information to create this task.`
+          }
+        }
+      ]
+    };
+  }
+);
+
+// Helper function for the prompt
+function getPriorityLabel(priority: number): string {
+  const labels = ["(No priority)", "(Low)", "(Medium)", "(High)", "(Urgent)"];
+  return labels[priority] || "";
+}
+```
+
+#### 2. Tool Implementation Example
+
+```typescript
+/**
+ * Tool: create-task
+ * Purpose: Creates a new task/issue in a specific team (state-modifying operation)
+ * Inputs:
+ *   - teamId: ID of the team where the task will be created
+ *   - title: Title of the new task
+ *   - description: Optional description of the task
+ *   - assigneeId: Optional ID of the user to assign the task to
+ *   - priority: Optional priority level (0-4)
+ *   - stateId: Optional workflow state ID
+ * Output: JSON object with details of the created task
+ */
+server.tool(
+  "create-task",
+  "Create a new task for a team",
+  {
+    // Define input schema with validation requirements
+    teamId: z.string().describe("ID of the team to create the task for"),
+    title: z.string().describe("Title of the task"),
+    description: z.string().optional().describe("Description of the task"),
+    assigneeId: z.string().optional().describe("ID of the user to assign the task to"),
+    priority: z.number().optional().describe("Priority of the task (0-4, where 0 is no priority)"),
+    stateId: z.string().optional().describe("ID of the state to set for the task")
+  },
+  // Tool implementation function
+  async ({ teamId, title, description, assigneeId, priority, stateId }) => {
+    console.error(`[Tool] Creating task "${title}" for team ID: ${teamId}`);
+    
+    try {
+      // Call the API to create a new issue
+      const issue = await apiClient.createIssue({
+        teamId,
+        title,
+        description,
+        assigneeId,
+        priority,
+        stateId
+      });
+
+      console.error(`[Tool] Successfully created task with ID: ${issue.id}`);
+      
+      // Return success response with issue details
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                id: issue.id,
+                title: issue.title,
+                url: issue.url,
+                message: "Task created successfully"
+              },
+              null,
+              2
+            )
+          }
+        ]
+      };
+    } catch (error) {
+      // Handle errors during task creation
+      console.error("[Error] Failed to create task:", error);
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: `Error creating task: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ]
+      };
+    }
+  }
+);
+```
+
+#### 3. Resource Implementation Example
+
+```typescript
+// Import the sample text from the resources/sample.js file. Need to use .js extension to avoid import errors.
+import { sampleText } from "./resources/sample.js";
+/**
+ * RESOURCE IMPLEMENTATION
+ *
+ * For read-only operations that provide data to the client, we use resources.
+ * Resources are identified by URIs and are meant to be browsed and consumed
+ * by clients without causing side effects.
+ */
+
+/**
+ * Resource: sample-text
+ * Purpose: Provides access to the content of the sample.txt file
+ * URI: sample://text
+ * Returns: The content of the sample.txt file
+ */
+server.resource("sample-text", "sample://text", async (uri) => {
+  console.error(`[Resource] Providing sample text content`);
+  try {
+    console.error(`[Resource] Successfully loaded sample text content`);
+
+    return {
+      contents: [
+        {
+          uri: uri.href,
+          text: sampleText,
+        },
+      ],
+    };
+  } catch (error) {
+    console.error(`[Error] Failed to load sample text: ${error}`);
+    return {
+      contents: [
+        {
+          uri: uri.href,
+          text: `Error: Failed to load sample text content. ${error}`,
+        },
+      ],
+      isError: true,
+    };
+  }
+});
+```
+
+#### 4. Dynamic Prompt Example using server.tool
+
+```typescript
+/**
+ * THIS IS AN EXAMPLE OF DYNAMIC PROMPTING
+ * Tool: meeting-agenda-generator
+ * Purpose: Generates a prompt for creating a structured meeting agenda
+ * Parameters:
+ *   - meetingTitle: Title or purpose of the meeting
+ *   - participants: Who will attend the meeting
+ *   - duration: Expected duration of the meeting (e.g., "30 minutes", "1 hour")
+ * Returns: A prompt for generating a structured meeting agenda
+ * Note: User must provide all three required variables (meetingTitle, participants, duration).
+ *       If any are missing, ask the user to provide the missing information.
+ */
+server.tool(
+  "meeting-agenda-generator",
+  // Here is separate prompting to let the LLM know it needs to collect these information
+  "Creates a prompt for generating a structured meeting agenda. User must provide meetingTitle, participants, and duration. If any are missing, ask the user to provide them.",
+  {
+    meetingTitle: z.string().describe("Title or purpose of the meeting"),
+    participants: z
+      .string()
+      .describe("Who will attend the meeting (roles or names)"),
+    duration: z
+      .string()
+      .describe(
+        "Expected duration of the meeting (e.g., '30 minutes', '1 hour')"
+      ),
+  },
+  async ({ meetingTitle, participants, duration }) => {
+    console.error(`[Tool] Generating meeting agenda for: ${meetingTitle}`);
+
+    const prompt = `Create a structured agenda for a "${meetingTitle}" meeting with ${participants} that will last ${duration}.
+
+The agenda should include:
+1. Meeting Objective (1-2 sentences)
+2. Discussion Topics (prioritized list with time allocations)
+3. Required Preparation for Participants
+4. Expected Outcomes/Deliverables
+5. Next Steps and Action Items Template
+
+Format the agenda to be clear, concise, and actionable. Ensure the timing works within the ${duration} constraint.`;
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: prompt,
+        },
+      ],
+    };
+  }
+);
+```
+
+### Configuration
+
+#### Claude Desktop Configuration
+Add your MCP server to Claude Desktop by configuring it in the settings:
+
+```json
+{
+  "mcpServers": {
+    "mcp-template": {
+      "command": "node",
+      "args": ["/Users/username/git-projects/mcp-template/build/index.js"],
+      "env": {
+        "API_KEY": "your-api-key-here",
+        "SECOND_API_KEY": "your-second-key-here",
+        "THIRD_API_KEY": "your-third-key-here"
+      },
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}
+```
+
+#### Cursor Configuration
+For Cursor, you can configure environment variables directly:
+
+```json
+env KEY1=value1 KEY2=value2 KEY3=value3 node /path/to/your/script.js
+```
+
+## Rate Limiting Implementation
+
+When working with external APIs, implement rate limiting to avoid hitting API limits:
+
+```typescript
+// Simple rate limiting implementation
+class RateLimiter {
+  private lastRequestTime: number = 0;
+  private requestsInWindow: number = 0;
+  
+  constructor(
+    private maxRequests: number = 5,
+    private timeWindowMs: number = 1000
+  ) {}
+  
+  async throttle(): Promise<void> {
+    const now = Date.now();
+    const timeElapsed = now - this.lastRequestTime;
+    
+    // Reset counter if time window has passed
+    if (timeElapsed > this.timeWindowMs) {
+      this.requestsInWindow = 0;
+      this.lastRequestTime = now;
+      return;
+    }
+    
+    // If we've hit the limit, wait until the window resets
+    if (this.requestsInWindow >= this.maxRequests) {
+      const waitTime = this.timeWindowMs - timeElapsed;
+      console.error(`[Rate Limit] Throttling for ${waitTime}ms`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+      this.requestsInWindow = 0;
+      this.lastRequestTime = Date.now();
+      return;
+    }
+    
+    // Increment counter
+    this.requestsInWindow++;
+  }
+}
+
+// Usage example
+const rateLimiter = new RateLimiter(5, 1000); // 5 requests per second
+
+async function makeApiCall() {
+  await rateLimiter.throttle();
+  // Now make the API call
+  return await apiClient.someMethod();
+}
+```
+
+## Type Definitions
+
+Always define proper types for your data structures:
+
+```typescript
+type Team = {
+  id: string;
+  name: string;
+  key: string;
+  description: string;
+};
+
+type Issue = {
+  id: string;
+  title: string;
+  description?: string;
+  state: string;
+  assignee?: string;
+  priority?: number;
+  createdAt: string;
+  url: string;
+};
+
+type ApiResponse<T> = {
+  data: T;
+  status: number;
+  message: string;
+};
+```
+```
